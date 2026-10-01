@@ -60,7 +60,7 @@ SELECT format(
 
 
 SELECT format(
-    'GRANT USAGE, SELECT ON SEQUENCE credit_applications_id_seq TO %I',
+    'GRANT USAGE, SELECT ON SEQUENCE credit_applications_id_seq, credit_applications_reference_seq TO %I',
     :'app_user'
 )
 \gexec

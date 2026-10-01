@@ -55,7 +55,7 @@ services:
           --set=ON_ERROR_STOP=1
           --tuples-only
           --no-align
-          --command='SELECT customer_id FROM public.customers LIMIT 0; SELECT application_reference FROM public.credit_applications LIMIT 0;'
+          --command='SELECT customer_id FROM public.customers LIMIT 0; SELECT application_reference, idempotency_key FROM public.credit_applications LIMIT 0; SELECT last_value FROM public.credit_applications_reference_seq;'
           > /dev/null
 
       interval: 5s
@@ -65,6 +65,64 @@ services:
 
     shm_size: 128mb
     stop_grace_period: 30s
+
+  backend:
+    build:
+      context: "https://github.com/jdug-jadodev/back-IAS.git#${BACKEND_REF:-main}"
+    pull_policy: build
+    restart: unless-stopped
+
+    environment:
+      DB_URL: r2dbc:postgresql://postgres:5432/${POSTGRES_DB}
+      DB_USER: ${APP_DB_USER}
+      DB_PASSWORD: ${APP_DB_PASSWORD}
+      SERVER_PORT: "8080"
+
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8080}:8080"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+        restart: true
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+    stop_grace_period: 30s
+
+  frontend:
+    build:
+      context: "https://github.com/jdug-jadodev/front-IAS.git#${FRONTEND_REF:-main}"
+    pull_policy: build
+    restart: unless-stopped
+
+    environment:
+      BACKEND_URL: http://backend:8080
+      NGINX_ENVSUBST_FILTER: BACKEND_URL
+
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-4201}:80"
+
+    depends_on:
+      backend:
+        condition: service_healthy
+        restart: true
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -O /dev/null http://127.0.0.1/
+          && wget -q -O /dev/null http://127.0.0.1/api/actuator/health
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
 volumes:
   postgres_data:

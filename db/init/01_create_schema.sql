@@ -21,10 +21,20 @@ CREATE TABLE customers (
 );
 
 
+CREATE SEQUENCE credit_applications_reference_seq AS BIGINT START WITH 1;
+
+CREATE FUNCTION next_application_reference() RETURNS TEXT
+LANGUAGE SQL VOLATILE AS '
+    SELECT ''REF-'' || CASE WHEN length(value) < 3 THEN lpad(value, 3, ''0'') ELSE value END
+    FROM (SELECT nextval(''credit_applications_reference_seq'')::TEXT AS value) sequence_value
+';
+
 CREATE TABLE credit_applications (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 
-    application_reference TEXT NOT NULL,
+    application_reference TEXT NOT NULL DEFAULT next_application_reference(),
+
+    idempotency_key TEXT NOT NULL,
 
     requested_customer_id TEXT NOT NULL,
 
@@ -44,6 +54,10 @@ CREATE TABLE credit_applications (
 
     CONSTRAINT uq_credit_applications_reference
         UNIQUE (application_reference),
+
+    CONSTRAINT uq_credit_applications_idempotency_key UNIQUE (idempotency_key),
+    CONSTRAINT chk_credit_applications_idempotency_key
+        CHECK (idempotency_key ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
 
     CONSTRAINT fk_credit_applications_customer
         FOREIGN KEY (customer_id)
