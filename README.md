@@ -11,7 +11,11 @@ Solo necesitas clonar **este repositorio** y configurar su `.env` una vez. Docke
 - [Arranques posteriores](#arranques-posteriores)
 - [Direcciones de acceso](#direcciones-de-acceso)
 - [Cómo funciona](#cómo-funciona)
+  - [Arquitectura interna de Compose](#arquitectura-interna-de-compose)
+  - [Flujo de construcción y arranque](#flujo-de-construcción-y-arranque)
+  - [Recorrido de una petición](#recorrido-de-una-petición)
 - [Variables de entorno](#variables-de-entorno)
+  - [Distribución de la configuración](#distribución-de-la-configuración)
 - [Estructura del repositorio](#estructura-del-repositorio)
 - [Base de datos y persistencia](#base-de-datos-y-persistencia)
 - [Actualizar el sistema](#actualizar-el-sistema)
@@ -135,33 +139,139 @@ Los puertos se publican en `127.0.0.1`, para acceder desde el equipo donde corre
 
 Las URLs de GitHub se utilizan directamente como contextos de construcción de Docker. El código se obtiene dentro del proceso de construcción; no se crean copias de esos proyectos en las carpetas de tu equipo.
 
-### Comunicación entre servicios
+Los siguientes diagramas utilizan **Mermaid** y se visualizan directamente en GitHub. Los componentes del despliegue son tres servicios de Compose; toda la API del sistema reside en el backend Java.
 
-```text
-Navegador
-    │ http://localhost:4201
-    ▼
-Frontend / Nginx :80
-    │ /api/... → http://backend:8080/...
-    ▼
-Backend :8080
-    │ r2dbc:postgresql://postgres:5432/DATABAE_IAS
-    ▼
-PostgreSQL :5432
-    │
-    ▼
-Volumen persistente postgres_data
+### Arquitectura interna de Compose
+
+Compose crea la red `creditos-local_default`, conecta los tres contenedores y publica sus puertos hacia el equipo anfitrión.
+
+```mermaid
+flowchart TB
+    subgraph HOST["Equipo anfitrión"]
+        BROWSER["Navegador<br/>Angular se ejecuta aquí"]
+        API_CLIENT["Swagger / Postman"]
+        DB_CLIENT["DBeaver / pgAdmin"]
+        INIT["Carpeta db/init"]
+        CHECKS["Carpeta db/checks"]
+    end
+
+    subgraph DOCKER["Docker · Proyecto creditos-local"]
+        subgraph NETWORK["Red interna: creditos-local_default"]
+            subgraph FRONT_CONTAINER["Contenedor: frontend"]
+                NGINX["Nginx :80<br/>Sirve HTML, CSS y JavaScript de Angular<br/>Proxy de /api hacia el backend"]
+            end
+            subgraph BACK_CONTAINER["Contenedor: backend"]
+                API["Spring Boot :8080<br/>API y reglas de crédito"]
+                R2DBC["Spring Data R2DBC<br/>Acceso reactivo a PostgreSQL"]
+            end
+            subgraph DB_CONTAINER["Contenedor: postgres"]
+                DB[("PostgreSQL :5432<br/>Base: DATABAE_IAS<br/>customers y credit_applications")]
+                INIT_PATH["/docker-entrypoint-initdb.d"]
+                CHECKS_PATH["/opt/creditos-checks"]
+            end
+        end
+        DATA[("Volumen: creditos-local_postgres_data<br/>Montado en /var/lib/postgresql/data")]
+    end
+
+    BROWSER <-->|"127.0.0.1:4201 → frontend:80"| NGINX
+    API_CLIENT <-->|"127.0.0.1:8080 → backend:8080"| API
+    DB_CLIENT <-->|"127.0.0.1:5432 → postgres:5432"| DB
+    NGINX <-->|"HTTP · http://backend:8080<br/>Quita el prefijo /api"| API
+    API <--> R2DBC
+    R2DBC <-->|"R2DBC · postgres:5432<br/>Usuario de aplicación: ias"| DB
+    DB <-->|"Lectura y escritura persistente"| DATA
+    INIT -.->|"Bind mount de solo lectura"| INIT_PATH
+    CHECKS -.->|"Bind mount de solo lectura"| CHECKS_PATH
+    INIT_PATH -.->|"Inicialización en un volumen vacío"| DB
+
+    classDef service fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef database fill:#ede9fe,stroke:#7c3aed,color:#2e1065;
+    classDef host fill:#fef3c7,stroke:#d97706,color:#78350f;
+    class NGINX,API,R2DBC service;
+    class DB,DATA database;
+    class BROWSER,API_CLIENT,DB_CLIENT,INIT,CHECKS host;
 ```
 
-Compose crea una red compartida. Dentro de ella, `backend` y `postgres` son los nombres que permiten encontrar los servicios.
+Las flechas continuas representan comunicación o acceso a datos; las discontinuas muestran los montajes y la inicialización. Los puertos del diagrama corresponden a los valores predeterminados de `.env.example`.
 
-El navegador utiliza rutas relativas `/api/...`. Nginx elimina ese prefijo y envía la petición al backend. Por ejemplo:
+Dentro de la red, `backend` y `postgres` se resuelven mediante el DNS de Docker. Los contenedores se comunican usando sus **puertos internos**, aunque cambies los puertos publicados en `.env`.
 
-```text
-GET http://localhost:4201/api/applications
-                    ↓
-GET http://backend:8080/applications
+### Flujo de construcción y arranque
+
+Este es el recorrido de `docker compose up -d`, desde la configuración local hasta la disponibilidad del sistema:
+
+```mermaid
+flowchart TD
+    START["docker compose up -d"] --> CONFIG["Leer compose.yaml y .env"]
+    CONFIG --> BUILD["Solicitar construcción<br/>pull_policy: build · caché de BuildKit"]
+
+    BUILD --> BACK_SOURCE["GitHub: back-IAS<br/>Referencia BACKEND_REF"]
+    BUILD --> FRONT_SOURCE["GitHub: front-IAS<br/>Referencia FRONTEND_REF"]
+    BACK_SOURCE --> BACK_BUILD["Dockerfile del backend<br/>JDK 21 + Gradle → bootJar"]
+    FRONT_SOURCE --> FRONT_BUILD["Dockerfile del frontend<br/>Node.js + npm ci → ng build"]
+    BACK_BUILD --> BACK_IMAGE["Imagen de ejecución<br/>JRE 21 + aplicación Java"]
+    FRONT_BUILD --> FRONT_IMAGE["Imagen de ejecución<br/>Nginx + archivos compilados de Angular"]
+    BACK_IMAGE --> INFRA["Preparar red, volumen y contenedores"]
+    FRONT_IMAGE --> INFRA
+
+    INFRA --> PG_START["Iniciar PostgreSQL"]
+    PG_START --> EMPTY{"¿El volumen está vacío?"}
+    EMPTY -->|"Sí"| INIT_DB["Ejecutar db/init en orden<br/>Esquema → clientes → usuario y permisos"]
+    EMPTY -->|"No"| EXISTING_DB["Utilizar la base y los datos existentes"]
+    INIT_DB --> PG_HEALTH{"¿PostgreSQL está healthy?"}
+    EXISTING_DB --> PG_HEALTH
+
+    PG_HEALTH -->|"Sí"| BACK_START["Iniciar backend<br/>depends_on: postgres healthy"]
+    PG_HEALTH -->|"No, tras los reintentos"| ERROR["Arranque incompleto<br/>Revisar docker compose logs"]
+    BACK_START --> BACK_HEALTH{"¿Backend está healthy?"}
+    BACK_HEALTH -->|"Sí"| FRONT_START["Iniciar frontend<br/>depends_on: backend healthy"]
+    BACK_HEALTH -->|"No, tras los reintentos"| ERROR
+    FRONT_START --> FRONT_HEALTH{"¿Frontend está healthy?"}
+    FRONT_HEALTH -->|"Sí"| READY["Sistema disponible<br/>Abrir http://localhost:4201"]
+    FRONT_HEALTH -->|"No, tras los reintentos"| ERROR
+
+    classDef process fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef decision fill:#fef3c7,stroke:#d97706,color:#78350f;
+    classDef success fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef failure fill:#fee2e2,stroke:#dc2626,color:#7f1d1d;
+    class CONFIG,BUILD,BACK_SOURCE,FRONT_SOURCE,BACK_BUILD,FRONT_BUILD,BACK_IMAGE,FRONT_IMAGE,INFRA,PG_START,INIT_DB,EXISTING_DB,BACK_START,FRONT_START process;
+    class EMPTY,PG_HEALTH,BACK_HEALTH,FRONT_HEALTH decision;
+    class READY success;
+    class ERROR failure;
 ```
+
+Las dos construcciones convergen antes del arranque; Docker puede ejecutar sus pasos secuencialmente o en paralelo. Los compiladores se utilizan durante la construcción y las imágenes finales contienen los componentes necesarios para ejecutar las aplicaciones.
+
+Compose espera las dependencias saludables antes de iniciar cada aplicación. Con `up -d`, puede devolver el control una vez iniciado el frontend, mientras su healthcheck sigue comprobando la disponibilidad. Usa `--wait` para esperar también ese resultado.
+
+### Recorrido de una petición
+
+El ejemplo muestra cómo la interfaz consulta el historial y recibe datos reales de PostgreSQL:
+
+```mermaid
+sequenceDiagram
+    actor Usuario
+    participant Browser as Navegador / Angular
+    participant Front as frontend / Nginx :80
+    participant Back as backend / Spring Boot :8080
+    participant Postgres as postgres / PostgreSQL :5432
+
+    Usuario->>Browser: Abrir http://localhost:4201
+    Browser->>Front: GET / por el puerto publicado 4201
+    Front-->>Browser: HTML, CSS y JavaScript de Angular
+    Note over Browser: Angular se inicia en el navegador
+
+    Browser->>Front: GET /api/applications?page=0&size=20
+    Note over Front: Quita /api y utiliza BACKEND_URL
+    Front->>Back: GET http://backend:8080/applications?page=0&size=20
+    Back->>Postgres: Consultar historial mediante R2DBC
+    Postgres-->>Back: Filas y total de solicitudes
+    Back-->>Front: HTTP 200 + JSON paginado
+    Front-->>Browser: HTTP 200 + JSON paginado
+    Browser-->>Usuario: Mostrar el historial de solicitudes
+```
+
+Para registrar una solicitud se utiliza el mismo recorrido con `POST /api/applications`: el backend evalúa los datos y registra el resultado en PostgreSQL antes de responder a la interfaz.
 
 La interfaz y la API se consumen desde el mismo origen del navegador, por lo que este recorrido no necesita configurar CORS.
 
@@ -208,6 +318,35 @@ El backend recibe `DB_URL`, `DB_USER`, `DB_PASSWORD` y `SERVER_PORT`. La URL uti
 El frontend recibe `BACKEND_URL=http://backend:8080` y `NGINX_ENVSUBST_FILTER=BACKEND_URL` para configurar el proxy de Nginx. No recibe las contraseñas de la base de datos.
 
 Los `.env` de los repositorios del backend y frontend no participan en este despliegue. La configuración se centraliza aquí y se pasa explícitamente a cada contenedor.
+
+### Distribución de la configuración
+
+```mermaid
+flowchart LR
+    EXAMPLE[".env.example<br/>Plantilla incluida en GitHub"]
+    ENV[".env<br/>Configuración local"]
+    COMPOSE["Docker Compose<br/>Interpreta compose.yaml"]
+    BUILD["Construcción desde GitHub<br/>BACKEND_REF y FRONTEND_REF"]
+    PG["postgres<br/>POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD<br/>APP_DB_USER y APP_DB_PASSWORD"]
+    BACK["backend<br/>DB_URL = postgres:5432 + POSTGRES_DB<br/>DB_USER = APP_DB_USER<br/>DB_PASSWORD = APP_DB_PASSWORD<br/>SERVER_PORT = 8080"]
+    FRONT["frontend / Nginx<br/>BACKEND_URL = http://backend:8080<br/>NGINX_ENVSUBST_FILTER = BACKEND_URL"]
+    PORTS["Puertos publicados en 127.0.0.1<br/>POSTGRES_PORT → 5432<br/>BACKEND_PORT → 8080<br/>FRONTEND_PORT → 80"]
+
+    EXAMPLE -->|"Copiar una vez"| ENV
+    ENV -->|"Variables para interpolar"| COMPOSE
+    COMPOSE -->|"Contextos de construcción"| BUILD
+    COMPOSE -->|"environment"| PG
+    COMPOSE -->|"environment"| BACK
+    COMPOSE -->|"environment"| FRONT
+    COMPOSE -->|"ports"| PORTS
+
+    classDef config fill:#fef3c7,stroke:#d97706,color:#78350f;
+    classDef service fill:#dbeafe,stroke:#2563eb,color:#172554;
+    class EXAMPLE,ENV,COMPOSE config;
+    class BUILD,PG,BACK,FRONT,PORTS service;
+```
+
+Las variables de las referencias Git se usan al construir las imágenes. Las credenciales y la dirección del proxy se inyectan al ejecutar los contenedores. En una base nueva, los scripts crean el usuario con las mismas credenciales que recibirá el backend.
 
 ### Cambiar puertos
 
